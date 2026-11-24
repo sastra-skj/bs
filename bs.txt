@@ -1,0 +1,651 @@
+//+------------------------------------------------------------------+
+//|                                               GridTrailingEA.mq5 |
+//|                                  Copyright 2026, Custom MQL5 Dev |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2026, Custom MQL5 Dev"
+#property link      "https://www.mql5.com"
+#property version   "1.50"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//--- Mode perhitungan lot grid
+enum ENUM_LOT_MODE
+  {
+   LOT_ADD      = 0, // Penambahan Lot (+ Step)
+   LOT_MULTIPLY = 1  // Pengalian Lot (* Multiplier)
+  };
+
+//--- Input Parameters
+input group "=== Pengaturan Umum & Entry Awal ==="
+input ulong          InpMagicNumber        = 20261124;      // Magic Number EA
+input double         InpInitialLot         = 0.01;          // Lot Entry Awal
+input int            InpPendingDistTicks   = 200;           // Jarak BuyStop / SellStop (ticks/points)
+input int            InpPendingRetryCount  = 3;             // Percobaan ulang jika gagal pasang Stop Order
+input double         InpGridBasketProfit   = 0.10;          // Target Profit Akumulasi Basket ($) saat Grid Aktif
+
+input group "=== Trailing Ketat (Hanya Saat 1 Posisi Awal) ==="
+input bool           InpUseTightTrailing   = true;          // Aktifkan Trailing Ketat (Single Entry)
+input int            InpTrailStartTicks    = 150;           // Profit minimal (ticks) sebelum trailing mulai
+input int            InpTightTrailTicks    = 50;            // Jarak trailing ketat (ticks) dari harga saat ini
+input int            InpTrailStepTicks     = 10;            // Minimal perubahan (ticks) untuk menggeser SL
+
+input group "=== Grid / Averaging Saat Minus ==="
+input bool           InpUseGridOnMinus     = true;          // Aktifkan Entry Tambahan Saat Minus
+input int            InpGridStepTicks      = 150;           // Jarak pergerakan minus (ticks) untuk entry baru
+input ENUM_LOT_MODE  InpLotMode            = LOT_MULTIPLY;  // Mode Lot: Penambahan atau Pengalian
+input double         InpLotAddValue        = 0.01;          // Nilai Penambahan Lot (jika mode Penambahan)
+input double         InpLotMultiplyValue   = 1.5;           // Nilai Pengalian Lot (jika mode Pengalian)
+input int            InpMaxGridOrders      = 10;            // Maksimal posisi tambahan (0 = tidak terbatas)
+
+//--- Objek Trading & Variabel Global
+CTrade          trade;
+ENUM_ORDER_TYPE_FILLING g_detectedFilling = ORDER_FILLING_FOK;
+datetime        g_lastResetTime     = 0;
+double          g_peakEquity        = 0.0;
+double          g_maxEquityDrawdown = 0.0;
+
+//+------------------------------------------------------------------+
+//| Auto-detect dan pasang mode filling yang didukung simbol broker  |
+//+------------------------------------------------------------------+
+void ConfigureFillingMode()
+  {
+   uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+
+   if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+     {
+      g_detectedFilling = ORDER_FILLING_FOK;
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+     }
+   else if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+     {
+      g_detectedFilling = ORDER_FILLING_IOC;
+      trade.SetTypeFilling(ORDER_FILLING_IOC);
+     }
+   else
+     {
+      g_detectedFilling = ORDER_FILLING_RETURN;
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+     }
+
+   PrintFormat("Auto-detect Filling Mode untuk %s: %s (mask=%u)",
+               _Symbol, EnumToString(g_detectedFilling), filling);
+  }
+
+//+------------------------------------------------------------------+
+//| Memperbarui pelacakan Equity Peak & Max Equity Drawdown         |
+//+------------------------------------------------------------------+
+void UpdateEquityDrawdownStats()
+  {
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if(g_peakEquity <= 0.0 || equity > g_peakEquity)
+      g_peakEquity = equity;
+
+   double currentDD = g_peakEquity - equity;
+   if(currentDD > g_maxEquityDrawdown)
+      g_maxEquityDrawdown = currentDD;
+  }
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(30);
+   ConfigureFillingMode();
+
+   if(InpInitialLot <= 0.0)
+     {
+      Print("Error: InpInitialLot harus lebih besar dari 0.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   if(InpGridBasketProfit <= 0.0)
+     {
+      Print("Error: InpGridBasketProfit harus lebih besar dari 0.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
+   g_peakEquity        = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_maxEquityDrawdown = 0.0;
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   Comment("");
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   if(_Point <= 0.0)
+      return;
+
+   UpdateEquityDrawdownStats();
+
+   int  totalPos    = CountPositions();
+   bool hasBuyStop  = HasPendingOrderType(ORDER_TYPE_BUY_STOP);
+   bool hasSellStop = HasPendingOrderType(ORDER_TYPE_SELL_STOP);
+
+   // 1. Jika sudah ada posisi terbuka, hapus semua pending order tersisa
+   if(totalPos > 0 && (hasBuyStop || hasSellStop || CountPendingOrders() > 0))
+     {
+      DeleteAllPendingOrders();
+      hasBuyStop  = false;
+      hasSellStop = false;
+     }
+
+   // 2. Mode Grid aktif (totalPos > 1):
+   //    - Tanpa trailing
+   //    - Langsung Close All cepat & Reset begitu akumulasi posisi profit
+   if(totalPos > 1)
+     {
+      double totalProfit = CalculateTotalFloatingProfit();
+      if(totalProfit >= InpGridBasketProfit)
+        {
+         PrintFormat("Akumulasi profit tercapai (%.2f >= %.2f). Fast Close All & Reset EA...",
+                     totalProfit, InpGridBasketProfit);
+         FastCloseAllPositions();
+         DeleteAllPendingOrders();
+         ResetEAState();
+         return;
+        }
+
+      if(InpUseGridOnMinus)
+         ManageGridOnMinus();
+
+      UpdateChartInfo(totalPos, hasBuyStop, hasSellStop);
+      return;
+     }
+
+   // 3. Mode Posisi Tunggal (totalPos == 1):
+   //    - Trailing ketat saat profit
+   //    - Entry tambahan searah saat minus
+   if(totalPos == 1)
+     {
+      if(InpUseTightTrailing)
+         ManageTightTrailing();
+
+      if(InpUseGridOnMinus)
+         ManageGridOnMinus();
+
+      UpdateChartInfo(totalPos, hasBuyStop, hasSellStop);
+      return;
+     }
+
+   // 4. Jika belum ada posisi terbuka, pastikan BuyStop DAN SellStop keduanya terpasang
+   if(totalPos == 0)
+     {
+      EnsureBothStopOrders(hasBuyStop, hasSellStop);
+      hasBuyStop  = HasPendingOrderType(ORDER_TYPE_BUY_STOP);
+      hasSellStop = HasPendingOrderType(ORDER_TYPE_SELL_STOP);
+     }
+
+   UpdateChartInfo(totalPos, hasBuyStop, hasSellStop);
+  }
+
+//+------------------------------------------------------------------+
+//| Memastikan BuyStop dan SellStop keduanya terpasang;             |
+//| jika salah satu gagal setelah retry, hapus yang sudah terpasang.  |
+//+------------------------------------------------------------------+
+void EnsureBothStopOrders(bool hasBuyStop, bool hasSellStop)
+  {
+   if(hasBuyStop && hasSellStop)
+      return;
+
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int    stops  = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   int    freeze = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   int    minGap = MathMax(stops, freeze) + 15;
+
+   int    distTicks = MathMax(InpPendingDistTicks, minGap);
+   double lot       = NormalizeLot(InpInitialLot);
+   int    retries   = MathMax(1, InpPendingRetryCount);
+
+   bool   buyOk  = hasBuyStop;
+   bool   sellOk = hasSellStop;
+
+   if(!buyOk)
+     {
+      int currentDist = distTicks;
+      for(int r = 0; r < retries; r++)
+        {
+         ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double buyStopPrice = NormalizeDouble(ask + currentDist * _Point, _Digits);
+         if(trade.BuyStop(lot, buyStopPrice, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, "Init BuyStop"))
+           {
+            buyOk = true;
+            break;
+           }
+         PrintFormat("Retry %d/%d gagal pasang BuyStop @ %.5f, RetCode=%d (%s)",
+                     r + 1, retries, buyStopPrice, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+         currentDist += 10;
+        }
+     }
+
+   if(!sellOk)
+     {
+      int currentDist = distTicks;
+      for(int r = 0; r < retries; r++)
+        {
+         bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double sellStopPrice = NormalizeDouble(bid - currentDist * _Point, _Digits);
+         if(trade.SellStop(lot, sellStopPrice, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, "Init SellStop"))
+           {
+            sellOk = true;
+            break;
+           }
+         PrintFormat("Retry %d/%d gagal pasang SellStop @ %.5f, RetCode=%d (%s)",
+                     r + 1, retries, sellStopPrice, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+         currentDist += 10;
+        }
+     }
+
+   if(!buyOk || !sellOk)
+     {
+      Print("Pasangan Stop Order tidak lengkap (BuyOk=", (buyOk ? "true" : "false"),
+            ", SellOk=", (sellOk ? "true" : "false"), "). Menghapus pending order yang terpasang...");
+      DeleteAllPendingOrders();
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Cek apakah tipe pending order tertentu sudah ada milik EA ini     |
+//+------------------------------------------------------------------+
+bool HasPendingOrderType(const ENUM_ORDER_TYPE targetType)
+  {
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+         (ulong)OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+        {
+         ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         if(type == targetType)
+            return true;
+        }
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Menghapus seluruh pending order milik EA ini                     |
+//+------------------------------------------------------------------+
+void DeleteAllPendingOrders()
+  {
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+         (ulong)OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+        {
+         ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         if(type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_SELL_STOP ||
+            type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_SELL_LIMIT)
+           {
+            trade.OrderDelete(ticket);
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Menutup seluruh posisi terbuka secepat mungkin                   |
+//+------------------------------------------------------------------+
+void FastCloseAllPositions()
+  {
+   trade.SetAsyncMode(true);
+
+   for(int attempt = 0; attempt < 10; attempt++)
+     {
+      int remaining = 0;
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0)
+            continue;
+
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            (ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+           {
+            remaining++;
+            trade.PositionClose(ticket, 30);
+           }
+        }
+
+      if(remaining == 0)
+         break;
+     }
+
+   trade.SetAsyncMode(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Reset status EA setelah siklus selesai                           |
+//+------------------------------------------------------------------+
+void ResetEAState()
+  {
+   g_lastResetTime = TimeCurrent();
+   g_peakEquity    = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   Comment("EA di-reset pada ", TimeToString(g_lastResetTime, TIME_DATE | TIME_SECONDS),
+           "\nMax Equity DD Tercatat: ", DoubleToString(g_maxEquityDrawdown, 2),
+           "\nMenyiapkan siklus entry baru...");
+  }
+
+//+------------------------------------------------------------------+
+//| Trailing ketat (hanya saat totalPos == 1)                        |
+//+------------------------------------------------------------------+
+void ManageTightTrailing()
+  {
+   if(CountPositions() != 1)
+      return;
+
+   double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int    stops = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+
+   int minStopTicks = MathMax(InpTightTrailTicks, stops + 5);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
+         (ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      ENUM_POSITION_TYPE posType   = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double             openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double             currentSL = PositionGetDouble(POSITION_SL);
+      double             currentTP = PositionGetDouble(POSITION_TP);
+
+      if(posType == POSITION_TYPE_BUY)
+        {
+         double profitTicks = (bid - openPrice) / _Point;
+         if(profitTicks >= InpTrailStartTicks)
+           {
+            double desiredSL = NormalizeDouble(bid - minStopTicks * _Point, _Digits);
+            if(desiredSL < bid - (stops + 2) * _Point)
+              {
+               if(currentSL == 0.0 || (desiredSL - currentSL) >= InpTrailStepTicks * _Point)
+                 {
+                  trade.PositionModify(ticket, desiredSL, currentTP);
+                 }
+              }
+           }
+        }
+      else if(posType == POSITION_TYPE_SELL)
+        {
+         double profitTicks = (openPrice - ask) / _Point;
+         if(profitTicks >= InpTrailStartTicks)
+           {
+            double desiredSL = NormalizeDouble(ask + minStopTicks * _Point, _Digits);
+            if(desiredSL > ask + (stops + 2) * _Point)
+              {
+               if(currentSL == 0.0 || (currentSL - desiredSL) >= InpTrailStepTicks * _Point)
+                 {
+                  trade.PositionModify(ticket, desiredSL, currentTP);
+                 }
+              }
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Entry tambahan searah posisi awal saat kondisi minus           |
+//+------------------------------------------------------------------+
+void ManageGridOnMinus()
+  {
+   int totalPos = CountPositions();
+   if(totalPos <= 0)
+      return;
+
+   int gridCount = totalPos - 1;
+   if(InpMaxGridOrders > 0 && gridCount >= InpMaxGridOrders)
+      return;
+
+   ENUM_POSITION_TYPE firstType     = POSITION_TYPE_BUY;
+   double             lastOpenPrice = 0.0;
+   double             lastLot       = InpInitialLot;
+   datetime           firstTime     = 0;
+   datetime           lastTime      = 0;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         (ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+        {
+         datetime           posTime  = (datetime)PositionGetInteger(POSITION_TIME);
+         double             posPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double             posLot   = PositionGetDouble(POSITION_VOLUME);
+         ENUM_POSITION_TYPE pType    = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+         if(firstTime == 0 || posTime < firstTime)
+           {
+            firstTime = posTime;
+            firstType = pType;
+           }
+
+         if(lastTime == 0 || posTime >= lastTime)
+           {
+            lastTime      = posTime;
+            lastOpenPrice = posPrice;
+            lastLot       = posLot;
+           }
+        }
+     }
+
+   double ask       = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid       = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double stepPrice = InpGridStepTicks * _Point;
+
+   bool   shouldAddEntry = false;
+   double nextLot        = CalculateNextLot(lastLot);
+
+   if(firstType == POSITION_TYPE_BUY)
+     {
+      if((lastOpenPrice - ask) >= stepPrice)
+         shouldAddEntry = true;
+     }
+   else if(firstType == POSITION_TYPE_SELL)
+     {
+      if((bid - lastOpenPrice) >= stepPrice)
+         shouldAddEntry = true;
+     }
+
+   if(shouldAddEntry && nextLot > 0.0)
+     {
+      RemoveAllStopLosses();
+
+      bool ok = false;
+      if(firstType == POSITION_TYPE_BUY)
+         ok = trade.Buy(nextLot, _Symbol, ask, 0.0, 0.0, "Grid Buy");
+      else
+         ok = trade.Sell(nextLot, _Symbol, bid, 0.0, 0.0, "Grid Sell");
+
+      if(!ok)
+        {
+         PrintFormat("Gagal buka Grid order (%s), Lot=%.2f, RetCode=%d",
+                     EnumToString(firstType), nextLot, trade.ResultRetcode());
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Menghapus SL sisa saat masuk mode grid                           |
+//+------------------------------------------------------------------+
+void RemoveAllStopLosses()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         (ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+        {
+         double sl = PositionGetDouble(POSITION_SL);
+         double tp = PositionGetDouble(POSITION_TP);
+         if(sl != 0.0)
+            trade.PositionModify(ticket, 0.0, tp);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Menghitung lot berikutnya (Penambahan atau Pengalian)            |
+//+------------------------------------------------------------------+
+double CalculateNextLot(const double prevLot)
+  {
+   double rawLot = prevLot;
+   if(InpLotMode == LOT_ADD)
+      rawLot = prevLot + InpLotAddValue;
+   else if(InpLotMode == LOT_MULTIPLY)
+      rawLot = prevLot * InpLotMultiplyValue;
+
+   return NormalizeLot(rawLot);
+  }
+
+//+------------------------------------------------------------------+
+//| Normalisasi ukuran lot sesuai batas broker                       |
+//+------------------------------------------------------------------+
+double NormalizeLot(const double lot)
+  {
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(stepLot <= 0.0)
+      stepLot = 0.01;
+
+   double normalized = MathFloor((lot / stepLot) + 1e-7) * stepLot;
+   normalized = MathMax(minLot, MathMin(maxLot, normalized));
+
+   int digits = (int)MathRound(-MathLog10(stepLot));
+   digits = MathMax(0, MathMin(8, digits));
+   return NormalizeDouble(normalized, digits);
+  }
+
+//+------------------------------------------------------------------+
+//| Menghitung jumlah posisi terbuka milik EA                        |
+//+------------------------------------------------------------------+
+int CountPositions()
+  {
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         (ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+        {
+         count++;
+        }
+     }
+   return count;
+  }
+
+//+------------------------------------------------------------------+
+//| Menghitung jumlah pending order milik EA                         |
+//+------------------------------------------------------------------+
+int CountPendingOrders()
+  {
+   int count = 0;
+   for(int i = 0; i < OrdersTotal(); i++)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
+         (ulong)OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+        {
+         ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+         if(type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_SELL_STOP ||
+            type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_SELL_LIMIT)
+           {
+            count++;
+           }
+        }
+     }
+   return count;
+  }
+
+//+------------------------------------------------------------------+
+//| Menghitung total floating profit + swap seluruh posisi EA          |
+//+------------------------------------------------------------------+
+double CalculateTotalFloatingProfit()
+  {
+   double total = 0.0;
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         (ulong)PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+        {
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         double swap   = PositionGetDouble(POSITION_SWAP);
+         total += (profit + swap);
+        }
+     }
+   return total;
+  }
+
+//+------------------------------------------------------------------+
+//| Menampilkan informasi status di pojok kiri atas chart            |
+//+------------------------------------------------------------------+
+void UpdateChartInfo(const int posCount, const bool hasBuyStop, const bool hasSellStop)
+  {
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double currentDD  = MathMax(0.0, g_peakEquity - equity);
+   double floating   = CalculateTotalFloatingProfit();
+   string currency   = AccountInfoString(ACCOUNT_CURRENCY);
+   string modeText   = (posCount > 1) ? "MODE GRID (No Trailing - Fast Close All)" :
+                       (posCount == 1) ? "MODE SINGLE (Tight Trailing Aktif)" :
+                       "MENUNGGU TRIGGER STOP ORDER";
+
+   Comment("=== GridTrailingEA v1.50 ===\n",
+           "Status            : ", modeText, "\n",
+           "Filling Mode      : ", EnumToString(g_detectedFilling), "\n",
+           "Pending Stop      : BuyStop=", (hasBuyStop ? "OK" : "MISSING"),
+           " | SellStop=", (hasSellStop ? "OK" : "MISSING"), "\n",
+           "Posisi Terbuka    : ", posCount, "\n",
+           "Equity Saat Ini   : ", DoubleToString(equity, 2), " ", currency, "\n",
+           "Peak Equity       : ", DoubleToString(g_peakEquity, 2), " ", currency, "\n",
+           "Drawdown Saat Ini : ", DoubleToString(currentDD, 2), " ", currency, "\n",
+           "Max Equity DD     : ", DoubleToString(g_maxEquityDrawdown, 2), " ", currency, "\n",
+           "Floating Profit   : ", DoubleToString(floating, 2), " ", currency,
+           (posCount > 1 ? StringFormat(" / Target Close All: %.2f %s", InpGridBasketProfit, currency) : ""));
+  }
+//+------------------------------------------------------------------+
